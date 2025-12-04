@@ -12,6 +12,7 @@
 #include "ckernel_ops.h"
 #include "ckernel_template.h"
 #include "cunpack_common.h"
+#include "llk_defs.h"
 
 using namespace ckernel;
 using namespace ckernel::unpacker;
@@ -41,7 +42,7 @@ inline void _llk_unpack_tilize_mop_config_(const bool narrow_tile = false, const
     }
 }
 
-template <bool is_fp32_dest_acc_en, StochRndType stoch_rnd_mode = StochRndType::None>
+template <DestDatumWidth::Value dest_datum_width, StochRndType stoch_rnd_mode = StochRndType::None>
 inline void _llk_unpack_tilize_hw_configure_(
     const std::uint32_t unpack_src_format,
     const std::uint32_t unpack_dst_format,
@@ -54,7 +55,7 @@ inline void _llk_unpack_tilize_hw_configure_(
     constexpr bool fpu_srnd_en  = stoch_rnd_en || (stoch_rnd_mode == StochRndType::Fpu);
     constexpr bool pack_srnd_en = stoch_rnd_en || (stoch_rnd_mode == StochRndType::Pack);
 
-    configure_unpack_AB<is_fp32_dest_acc_en, is_row_pool, fpu_srnd_en, pack_srnd_en>(
+    configure_unpack_AB<dest_datum_width, is_row_pool, fpu_srnd_en, pack_srnd_en>(
         unpack_src_format, unpack_src_format, unpack_dst_format, unpack_dst_format, face_r_dim, face_r_dim, within_face_16x16_transpose, num_faces, num_faces);
 }
 
@@ -447,6 +448,27 @@ inline void _llk_unpack_tilize_uninit_(const std::uint32_t unpack_dst_format, co
         p_gpr_unpack::FACE_DIM_16x16); // GPR preloaded with  16 | (16 << 16)}
 }
 
+inline void _llk_unpack_tilizeA_B_uninit_(const std::uint32_t unpack_dst_format, const std::uint32_t face_r_dim = FACE_R_DIM)
+{
+    TT_SETADCXX(p_setadc::UNP_A, face_r_dim * FACE_C_DIM - 1, 0x0);
+    TT_SETADCXX(p_setadc::UNP_B, face_r_dim * FACE_C_DIM - 1, 0x0);
+    unpack_config_u config = {0};
+
+    config.f.out_data_format = unpack_dst_format;
+    config.f.throttle_mode   = 2;
+    TT_SETDMAREG(0, LOWER_HALFWORD(config.val[0]), 0, LO_16(p_gpr_unpack::TMP0));
+    TT_SETDMAREG(0, UPPER_HALFWORD(config.val[0]), 0, HI_16(p_gpr_unpack::TMP0));
+    TTI_REG2FLOP(1, 0, 0, 0, THCON_SEC0_REG2_Out_data_format_ADDR32 + 0 - THCON_CFGREG_BASE_ADDR32,
+                 p_gpr_unpack::TMP0); // Load unpack config[0]
+    TTI_REG2FLOP(
+        1,
+        0,
+        0,
+        0,
+        THCON_SEC0_REG5_Tile_x_dim_cntx0_ADDR32 - THCON_CFGREG_BASE_ADDR32,
+        p_gpr_unpack::FACE_DIM_16x16); // GPR preloaded with  16 | (16 << 16)}
+}
+
 /*************************************************************************
  * LLK UNPACK FAST TILIZE (Tilize single input using both unpackers and packer)
  * full_dim is the tensor width in number of tiles
@@ -460,10 +482,10 @@ inline void _llk_unpack_tilize_uninit_(const std::uint32_t unpack_dst_format, co
  * supported input formats are: FP32 (via FP16 or TF32) or FP16_B
  *************************************************************************/
 
-template <bool is_fp32_dest_acc_en>
+template <DestDatumWidth::Value dest_datum_width>
 inline void _llk_unpack_fast_tilize_hw_configure_(const std::uint32_t unpack_src_format, const std::uint32_t unpack_dst_format)
 {
-    configure_unpack_AB<is_fp32_dest_acc_en>(unpack_src_format, unpack_src_format, unpack_dst_format, unpack_dst_format);
+    configure_unpack_AB<dest_datum_width>(unpack_src_format, unpack_src_format, unpack_dst_format, unpack_dst_format);
 }
 
 inline void _llk_unpack_fast_tilize_mop_config_()
@@ -532,7 +554,7 @@ inline void _llk_unpack_fast_tilize_init_(const std::uint32_t unpack_dst_format,
     _llk_unpack_fast_tilize_mop_config_();
 }
 
-template <bool is_fp32_dest_acc_en>
+template <DestDatumWidth::Value dest_datum_width>
 inline void _llk_unpack_fast_tilize_uninit_()
 {
     // restore saved state

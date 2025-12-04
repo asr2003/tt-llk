@@ -6,6 +6,7 @@
 #pragma once
 
 #include "ckernel_sfpu_rsqrt_compat.h"
+#include "llk_defs.h"
 #include "sfpi.h"
 
 namespace ckernel
@@ -75,7 +76,7 @@ sfpi_inline sfpi::vFloat _sfpu_reciprocal_(const sfpi::vFloat in)
     return y;
 }
 
-template <bool APPROXIMATION_MODE, int ITERATIONS, bool is_fp32_dest_acc_en>
+template <bool APPROXIMATION_MODE, int ITERATIONS, DestDatumWidth::Value dest_datum_width>
 inline void _calculate_reciprocal_internal_(const int iterations)
 {
 #pragma GCC unroll 8
@@ -89,7 +90,7 @@ inline void _calculate_reciprocal_internal_(const int iterations)
         }
         else
         {
-            if constexpr (is_fp32_dest_acc_en)
+            if constexpr (dest_datum_width)
             {
                 sfpi::dst_reg[0] = _sfpu_reciprocal_<2>(in);
             }
@@ -104,29 +105,35 @@ inline void _calculate_reciprocal_internal_(const int iterations)
     }
 }
 
-template <bool APPROXIMATION_MODE, int ITERATIONS, bool is_fp32_dest_acc_en, bool legacy_compat = false>
+template <bool APPROXIMATION_MODE, int ITERATIONS, DestDatumWidth::Value dest_datum_width, bool legacy_compat = false>
 inline void _calculate_reciprocal_(const int iterations)
 {
     if constexpr (legacy_compat)
     {
-        _calculate_reciprocal_compat_<APPROXIMATION_MODE, ITERATIONS, is_fp32_dest_acc_en>(iterations);
+        _calculate_reciprocal_compat_<APPROXIMATION_MODE, ITERATIONS, dest_datum_width>(iterations);
     }
     else
     {
-        _calculate_reciprocal_internal_<APPROXIMATION_MODE, ITERATIONS, is_fp32_dest_acc_en>(iterations);
+        _calculate_reciprocal_internal_<APPROXIMATION_MODE, ITERATIONS, dest_datum_width>(iterations);
     }
 }
 
-template <bool APPROXIMATION_MODE, bool legacy_compat = false>
+template <bool APPROXIMATION_MODE>
+inline void _init_sfpu_reciprocal_()
+{
+    // The polynomial y = k2 - k1*x + k0*x**2 minimises the maximum
+    // relative error for 1/x over the interval [1,2), via Sollya.
+    sfpi::vConstFloatPrgm0 = 0.3232325017452239990234375f;
+    sfpi::vConstFloatPrgm1 = 1.4545459747314453125f;
+    sfpi::vConstFloatPrgm2 = 2.121212482452392578125f;
+}
+
+template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool legacy_compat = false>
 inline void _init_reciprocal_()
 {
     if constexpr (!legacy_compat)
     {
-        // The polynomial y = k2 - k1*x + k0*x**2 minimises the maximum
-        // relative error for 1/x over the interval [1,2), via Sollya.
-        sfpi::vConstFloatPrgm0 = 0.3232325017452239990234375f;
-        sfpi::vConstFloatPrgm1 = 1.4545459747314453125f;
-        sfpi::vConstFloatPrgm2 = 2.121212482452392578125f;
+        _init_sfpu_reciprocal_<APPROXIMATION_MODE>();
     }
 }
 

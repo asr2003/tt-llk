@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 import math
+from typing import Optional
 
 import torch
-from helpers.format_arg_mapping import (
+from helpers.format_config import DataFormat
+from helpers.llk_params import (
     DestAccumulation,
     MathFidelity,
     MathOperation,
@@ -11,23 +13,17 @@ from helpers.format_arg_mapping import (
     ReducePool,
     format_dict,
 )
-from helpers.format_config import DataFormat
 from helpers.tilize_untilize import tilize_block
 
+# Tile and face dimension constants
+FACE_DIM = 16
+ELEMENTS_PER_FACE = 256  # 16x16 = 256 elements per face
+FACES_PER_TILE = 4
+ELEMENTS_PER_TILE = 1024  # 4 faces × 256 elements
+TILE_SIZE = 32
+TILE_DIMENSIONS = (32, 32)  # Tile dimensions as tuple
+
 golden_registry = {}
-
-_FIDELITY_MASK_CONFIGURATION = {
-    0: (0x7C0, 0x7F0),
-    1: (0x3E, 0x7F0),
-    2: (0x7C0, 0x0F0),
-    3: (0x3E, 0x0F),
-}
-
-
-def apply_masks(mantissas_1, mantissas_2, math_fidelity_phase):
-    """Apply masks to mantissas based on math fidelity phase."""
-    a_mask, b_mask = _FIDELITY_MASK_CONFIGURATION[math_fidelity_phase]
-    return mantissas_1 & a_mask, mantissas_2 & b_mask
 
 
 def check_bfp8_b(operand: list) -> list:
@@ -111,114 +107,193 @@ def get_golden_generator(cls):
     return golden_registry[cls]
 
 
+class SrcFormatModel:
+    """
+    Source register holds data in TF32 format.
+
+    This class is supposed to model how input data is converted to the source register format.
+    """
+
+    @staticmethod
+    def to_src_format(format_from: DataFormat, tensor: torch.Tensor) -> torch.Tensor:
+        """Returns tuple (matrix_sign, matrix_exponent, matrix_mantissa)"""
+        CONVERSION_MAP = {
+            DataFormat.Bfp8_b: SrcFormatModel._bfp8b_to_tf32,
+            DataFormat.Float16_b: SrcFormatModel._fp16b_to_tf32,
+            DataFormat.Float16: SrcFormatModel._fp16_to_tf32,
+            DataFormat.Float32: SrcFormatModel._fp32_to_tf32,
+        }
+
+        # todo: value error
+
+        return CONVERSION_MAP[format_from](tensor)
+
+    @staticmethod
+    def _exponent_bias(exponent_width: int) -> int:
+        return (1 << (exponent_width - 1)) - 1
+
+    @staticmethod
+    def _bfp8b_to_tf32(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """PyTorch doesn't natively support bfp8, so it's implemented as bfloat16 in test infra"""
+
+        return SrcFormatModel._fp16b_to_tf32(tensor)
+
+    @staticmethod
+    def _fp16b_to_tf32(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Handles Float16_b (and Bfp8_b)"""
+
+        tensor_raw = tensor.to(torch.bfloat16).view(torch.uint16).to(torch.int64)
+
+        BFP16_MANT_WIDTH = 7
+        BFP16_EXP_WIDTH = 8
+        BFP16_SIGN_WIDTH = 1
+
+        BFP16_MANT_SHAMT = 0
+        BFP16_EXP_SHAMT = BFP16_MANT_WIDTH
+        BFP16_SIGN_SHAMT = BFP16_MANT_WIDTH + BFP16_EXP_WIDTH
+
+        BFP16_MANT_MASK = ((1 << BFP16_MANT_WIDTH) - 1) << BFP16_MANT_SHAMT
+        BFP16_EXP_MASK = ((1 << BFP16_EXP_WIDTH) - 1) << BFP16_EXP_SHAMT
+        BFP16_SIGN_MASK = ((1 << BFP16_SIGN_WIDTH) - 1) << BFP16_SIGN_SHAMT
+
+        sign = (tensor_raw & BFP16_SIGN_MASK) >> BFP16_SIGN_SHAMT
+        exp = (tensor_raw & BFP16_EXP_MASK) >> BFP16_EXP_SHAMT
+        mant = (tensor_raw & BFP16_MANT_MASK) >> BFP16_MANT_SHAMT
+
+        # apply exponent bias
+        exp = exp - SrcFormatModel._exponent_bias(BFP16_EXP_WIDTH)
+
+        # when converting BFPx -> TF32, 3 LSBs are implied 0
+        BFP16_TF32_MANT_RIGHT_PAD = 3
+        mant = mant << BFP16_TF32_MANT_RIGHT_PAD
+
+        # handle MSB is implied 1
+        mant = mant | (1 << (BFP16_MANT_WIDTH + BFP16_TF32_MANT_RIGHT_PAD))
+
+        return (sign, exp, mant)
+
+    @staticmethod
+    def _fp16_to_tf32(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Handles Float16"""
+
+        tensor_raw = tensor.to(torch.float16).view(torch.uint16).to(torch.int64)
+
+        FP16_MANT_WIDTH = 10
+        FP16_EXP_WIDTH = 5
+        FP16_SIGN_WIDTH = 1
+
+        FP16_MANT_SHAMT = 0
+        FP16_EXP_SHAMT = FP16_MANT_WIDTH
+        FP16_SIGN_SHAMT = FP16_MANT_WIDTH + FP16_EXP_WIDTH
+
+        FP16_MANT_MASK = ((1 << FP16_MANT_WIDTH) - 1) << FP16_MANT_SHAMT
+        FP16_EXP_MASK = ((1 << FP16_EXP_WIDTH) - 1) << FP16_EXP_SHAMT
+        FP16_SIGN_MASK = ((1 << FP16_SIGN_WIDTH) - 1) << FP16_SIGN_SHAMT
+
+        sign = (tensor_raw & FP16_SIGN_MASK) >> FP16_SIGN_SHAMT
+        exp = (tensor_raw & FP16_EXP_MASK) >> FP16_EXP_SHAMT
+        mant = (tensor_raw & FP16_MANT_MASK) >> FP16_MANT_SHAMT
+
+        # apply exponent bias
+        exp = exp - SrcFormatModel._exponent_bias(FP16_EXP_WIDTH)
+
+        # handle MSB is implied 1
+        mant = mant | (1 << FP16_MANT_WIDTH)
+
+        return (sign, exp, mant)
+
+    @staticmethod
+    def _fp32_to_tf32(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Handles Float32"""
+
+        tensor_raw = tensor.to(torch.float32).view(torch.uint32).to(torch.int64)
+
+        FP32_MANT_WIDTH = 23
+        FP32_EXP_WIDTH = 8
+        FP32_SIGN_WIDTH = 1
+
+        FP32_MANT_SHAMT = 0
+        FP32_EXP_SHAMT = FP32_MANT_WIDTH
+        FP32_SIGN_SHAMT = FP32_MANT_WIDTH + FP32_EXP_WIDTH
+
+        FP32_MANT_MASK = ((1 << FP32_MANT_WIDTH) - 1) << FP32_MANT_SHAMT
+        FP32_EXP_MASK = ((1 << FP32_EXP_WIDTH) - 1) << FP32_EXP_SHAMT
+        FP32_SIGN_MASK = ((1 << FP32_SIGN_WIDTH) - 1) << FP32_SIGN_SHAMT
+
+        sign = (tensor_raw & FP32_SIGN_MASK) >> FP32_SIGN_SHAMT
+        exp = (tensor_raw & FP32_EXP_MASK) >> FP32_EXP_SHAMT
+        mant = (tensor_raw & FP32_MANT_MASK) >> FP32_MANT_SHAMT
+
+        FP32_TF32_MANT_RIGHT_TRUNC = 13
+
+        # apply exponent bias
+        exp = exp - SrcFormatModel._exponent_bias(FP32_EXP_WIDTH)
+
+        # when converting FP32 -> TF32, 13 LSBs are truncated
+        mant = mant >> FP32_TF32_MANT_RIGHT_TRUNC
+
+        # handle MSB is implied 1
+        mant = mant | (1 << (FP32_MANT_WIDTH - FP32_TF32_MANT_RIGHT_TRUNC))
+
+        return (sign, exp, mant)
+
+    @staticmethod
+    def from_src_format(
+        data_format: DataFormat,
+        tensor: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        # int64, int64, int64 tensors
+        sign, exp, mant = tensor
+
+        # Convert mantissa with non-implied 1 to fractional value
+        TF32_MANT_WIDTH = 10
+        frac = mant.to(torch.float32) / (1 << TF32_MANT_WIDTH)
+
+        reassembled = ((-1.0) ** sign) * (2.0**exp) * frac
+
+        torch_format = format_dict.get(data_format, format_dict[DataFormat.Float16_b])
+        return reassembled.to(torch_format)
+
+
 class FidelityMasking:
+
     def _apply_fidelity_masking(
-        self, operand1, operand2, math_fidelity_phase, data_format
+        self,
+        data_format: DataFormat,
+        operand_a: torch.Tensor,
+        operand_b: torch.Tensor,
+        fidelity_iteration: int,
     ):
+        if (fidelity_iteration < 0) or (fidelity_iteration > 3):
+            raise ValueError(f"Invalid fidelity iteration: {fidelity_iteration}")
 
-        # Extract exponents from all operands based on data format
-        if data_format == DataFormat.Float16:
-            # Convert operands to uint16 for bitwise operations
-            operand1_uint = operand1.to(torch.float16).view(torch.uint16)
-            operand2_uint = operand2.to(torch.float16).view(torch.uint16)
+        FP_FIDELITY_ITER_MASK = [
+            (0b11111000000, 0b11111110000),
+            (0b00000111110, 0b11111110000),
+            (0b11111000000, 0b00000001111),
+            (0b00000111110, 0b00000001111),
+        ]
 
-            # Mask 5 bits starting from 2nd MSB (bits 10 to 14)
-            exponent_mask = 0x7C00  # 0111 1100 0000 0000
+        sign_a, exp_a, mant_a = SrcFormatModel.to_src_format(data_format, operand_a)
+        sign_b, exp_b, mant_b = SrcFormatModel.to_src_format(data_format, operand_b)
 
-            exponents_1 = operand1_uint & exponent_mask
-            exponents_2 = operand2_uint & exponent_mask
-            exponents_1 = exponents_1.to(torch.int32) >> 10
-            exponents_2 = exponents_2.to(torch.int32) >> 10
+        fidelity_mask_a, fidelity_mask_b = FP_FIDELITY_ITER_MASK[fidelity_iteration]
 
-            sign_mask = 0x8000  # 1000 0000 0000 0000
-            sign_1 = operand1_uint & sign_mask
-            sign_2 = operand2_uint & sign_mask
+        mant_a = mant_a & fidelity_mask_a
+        mant_b = mant_b & fidelity_mask_b
 
-            mantissa_mask = 0x3FF  # 0000 0011 1111 1111
-            mantissas_1 = operand1_uint & mantissa_mask
-            mantissas_2 = operand2_uint & mantissa_mask
+        repack_a = SrcFormatModel.from_src_format(data_format, (sign_a, exp_a, mant_a))
+        repack_b = SrcFormatModel.from_src_format(data_format, (sign_b, exp_b, mant_b))
 
-        elif data_format in [DataFormat.Float16_b, DataFormat.Bfp8_b]:
-            # Convert operands to uint16 for bitwise operations
-            operand1_uint = operand1.to(torch.bfloat16).view(torch.uint16)
-            operand2_uint = operand2.to(torch.bfloat16).view(torch.uint16)
-
-            # Mask 8 bits starting from 2nd MSB (bits 7 to 14)
-            exponent_mask = 0x7F80  # 0111 1111 1000 0000
-
-            exponents_1 = operand1_uint & exponent_mask
-            exponents_2 = operand2_uint & exponent_mask
-            exponents_1 = exponents_1.to(torch.int32) >> 7
-            exponents_2 = exponents_2.to(torch.int32) >> 7
-
-            sign_mask = 0x8000  # 1000 0000 0000 0000
-            sign_1 = operand1_uint & sign_mask
-            sign_2 = operand2_uint & sign_mask
-
-            mantissa_mask = 0x7F  # 0000 0000 0111 1111
-            mantissas_1 = operand1_uint & mantissa_mask
-            mantissas_2 = operand2_uint & mantissa_mask
-
-            mantissas_1 = mantissas_1.to(torch.int32) << 3
-            mantissas_2 = mantissas_2.to(torch.int32) << 3
-
-        elif data_format == DataFormat.Float32:
-            # Convert operands to uint32 for bitwise operations
-            operand1_uint = operand1.to(torch.float32).view(torch.uint32)
-            operand2_uint = operand2.to(torch.float32).view(torch.uint32)
-
-            # Mask 8 bits starting from 2nd MSB (bits 23 to 30)
-            exponent_mask = 0x7F800000  # 0111 1111 1000 0000 0000 0000 0000 0000
-
-            exponents_1 = operand1_uint & exponent_mask
-            exponents_2 = operand2_uint & exponent_mask
-
-            exponents_1 = exponents_1.to(torch.int32) >> 23
-            exponents_2 = exponents_2.to(torch.int32) >> 23
-
-            sign_mask = 0x80000000  # 1000 0000 0000 0000 0000 0000 0000 0000
-            sign_1 = operand1_uint & sign_mask
-            sign_2 = operand2_uint & sign_mask
-
-            mantissa_mask = 0x007FFFFF  # 0000 0000 0111 1111 1111 1111 1111 1111
-            mantissas_1 = operand1_uint & mantissa_mask
-            mantissas_2 = operand2_uint & mantissa_mask
-
-            mantissas_1 = mantissas_1.to(torch.int32) >> 13
-            mantissas_2 = mantissas_2.to(torch.int32) >> 13
-        else:
-            raise ValueError(
-                f"Unsupported data format for fidelity application: {data_format}"
-            )
-
-        mantissa_msb = 0x400  # 1 << 10, MSB of an 11-bit number
-
-        mantissas_1 = mantissas_1 | mantissa_msb
-        mantissas_2 = mantissas_2 | mantissa_msb
-
-        mantissas_1, mantissas_2 = apply_masks(
-            mantissas_1, mantissas_2, math_fidelity_phase
-        )
-
-        # Recombine the sign, exponent, and mantissa bits
-        sign_1 = sign_1.to(torch.int16)
-        exponents_1 = exponents_1.to(torch.int16)
-        mantissas_1 = mantissas_1.to(torch.int16)
-        sign_2 = sign_2.to(torch.int16)
-        exponents_2 = exponents_2.to(torch.int16)
-        mantissas_2 = mantissas_2.to(torch.int16)
-
-        reassembled1, reassembled2 = reassemble_float_after_fidelity(
-            data_format,
-            sign_1,
-            sign_2,
-            exponents_1,
-            exponents_2,
-            mantissas_1,
-            mantissas_2,
-        )
-
-        return reassembled1, reassembled2
+        return repack_a, repack_b
 
 
 def to_tensor(operand, data_format):
@@ -239,75 +314,90 @@ def transpose_tensor(tensor):
 @register_golden
 class TransposeGolden:
     def __init__(self):
-        pass  # Removed ops dict since __call__ is no longer used
+        pass
 
     def transpose_within_faces(
         self,
         operand,
         data_format: DataFormat,
         input_dimensions: list[int] = [32, 32],
+        num_faces: int = 4,
     ):
-        """Transpose a tile tensor by transposing within each of the four faces.
-        A tile tensor consists of 4 equal faces arranged in a tile.
-        This function dynamically splits the tensor into 4 faces, transposes each face
-        individually, and reassembles the tile.
+        """Transpose a tile tensor by transposing within each face.
+        A tile tensor consists of faces, each face is always 16x16 = 256 elements.
+        For num_faces < 4, we process only the first num_faces faces from the tensor.
         Args:
             operand: Input tensor to transpose
             data_format: Data format for the result
+            input_dimensions: Input tensor dimensions (for compatibility)
+            num_faces: Number of faces in the tile (1, 2, or 4)
         Returns:
-            torch.Tensor: Tensor with each face transposed, flattened back to original size
+            torch.Tensor: Tensor with each face transposed, result size = num_faces * 256
         """
-        tensor = to_tensor(operand, data_format)
-        total_elements = tensor.numel()
-        if total_elements % 4 != 0:
-            raise ValueError(
-                f"Tensor size {total_elements} must be divisible by 4 for tile structure"
-            )
-        face_size = total_elements // 4
-        face_dim = math.isqrt(face_size)
-        if face_dim * face_dim != face_size:
-            raise ValueError(
-                f"Each face must be square (for now). Face size {face_size} is not a perfect square"
-            )
+        if num_faces not in [1, 2, 4]:
+            raise ValueError(f"num_faces must be 1, 2, or 4, got {num_faces}")
 
-        # Split the tensor into 4 faces dynamically
-        # Transpose each face using the helper function
-        result = tensor.view(4, face_dim, face_dim).transpose(-2, -1).flatten()
-        return result.to(format_dict[data_format])
+        tensor = to_tensor(operand, data_format)
+        torch_format = format_dict[data_format]
+
+        # Each face is always 16x16 = 256 elements
+        face_size = ELEMENTS_PER_FACE
+        face_dim = FACE_DIM
+        elements_per_tile_needed = face_size * num_faces
+
+        # Select first N faces
+        tensor_to_process = tensor[:elements_per_tile_needed]
+
+        # Split into faces and transpose each face individually
+        faces = tensor_to_process.view(num_faces, face_dim, face_dim)
+        transposed_faces = faces.transpose(-2, -1)
+        result = transposed_faces.flatten().to(torch_format)
+
+        return result
 
     def transpose_faces(
         self,
         operand,
         data_format: DataFormat,
         input_dimensions: list[int] = [32, 32],
+        num_faces: int = 4,
     ):
-        """Transpose the arrangement of the four faces in a tile tensor.
+        """Transpose the arrangement of faces in a tile tensor.
         Treats each face as a single element and transposes their arrangement.
-        If faces are arranged as:
+
+        For 4 faces arranged as:
         f0 f1
         f2 f3
         After transposition:
         f0 f2
         f1 f3
+
+        For 2 faces: f0, f1 -> f0, f1 (no change in linear arrangement)
+        For 1 face: f0 -> f0 (identity operation)
+
         Args:
             operand: Input tensor to transpose
             data_format: Data format for the result
+            input_dimensions: Input tensor dimensions (for compatibility)
+            num_faces: Number of faces in the tile (1, 2, or 4)
         Returns:
             torch.Tensor: Tensor with faces rearranged in transposed order
         """
+        if num_faces not in [1, 2, 4]:
+            raise ValueError(f"num_faces must be 1, 2, or 4, got {num_faces}")
+
+        torch_format = format_dict[data_format]
         tensor = to_tensor(operand, data_format)
-        total_elements = tensor.numel()
-        if total_elements % 4 != 0:
-            raise ValueError(
-                f"Invalid tensor size {total_elements}. A valid tile structure requires the tensor to represent "
-                f"4 equal faces, so the total number of elements must be divisible by 4."
-            )
-        face_size = total_elements // 4
-        # Split the tensor into 4 faces
-        faces = torch.tensor_split(tensor, 4)
-        # Transpose the face arrangement: f0,f1,f2,f3 -> f0,f2,f1,f3
-        result = torch.cat([faces[0], faces[2], faces[1], faces[3]])
-        return result.to(format_dict[data_format])
+
+        total_elements = ELEMENTS_PER_FACE * num_faces
+        tensor = tensor[:total_elements]
+
+        if num_faces == 4:
+            # Reorder faces: f0, f1, f2, f3 -> f0, f2, f1, f3
+            faces = torch.tensor_split(tensor, 4)
+            tensor = torch.cat([faces[0], faces[2], faces[1], faces[3]])
+
+        return tensor.to(torch_format)
 
     def _apply_tile_operation_multi_tile(
         self,
@@ -342,10 +432,6 @@ class TransposeGolden:
             ValueError: If tensor size doesn't match expected size for num_tiles
             ValueError: If num_tiles is not positive
         """
-        # Constants
-        ELEMENTS_PER_TILE = 1024  # 32 × 32
-        TILE_DIMENSIONS = (32, 32)
-
         # Input validation
         if num_tiles <= 0:
             raise ValueError(f"num_tiles must be positive, got {num_tiles}")
@@ -525,13 +611,20 @@ class MatmulGolden(FidelityMasking):
 
             output_dimensions = [M, N]
 
-        num_fidelity_phases = math_fidelity.value
+        MATH_FIDELITY_TO_ITER_COUNT = {
+            MathFidelity.LoFi: 0,
+            MathFidelity.HiFi2: 1,
+            MathFidelity.HiFi3: 2,
+            MathFidelity.HiFi4: 3,
+        }
+
+        fidelity_iter_count = MATH_FIDELITY_TO_ITER_COUNT[math_fidelity]
 
         res = 0
 
-        if num_fidelity_phases == 0:
+        if fidelity_iter_count == 0:
 
-            t1, t2 = self._apply_fidelity_masking(t1, t2, 0, data_format)
+            t1, t2 = self._apply_fidelity_masking(data_format, t1, t2, 0)
             t1, t2 = t1.view(M, K1), t2.view(K2, N)
             res = (
                 torch.matmul(t1, t2)
@@ -539,29 +632,9 @@ class MatmulGolden(FidelityMasking):
                 .to(torch_format)
             )
 
-        elif num_fidelity_phases == 1:
+        elif fidelity_iter_count == 1:
 
-            t1, t2 = self._apply_fidelity_masking(t1, t2, 0, data_format)
-            t1, t2 = t1.view(M, K1), t2.view(K2, N)
-            res = (
-                torch.matmul(t1, t2)
-                .view(output_dimensions[0] * output_dimensions[1])
-                .to(torch_format)
-            )
-
-            t1 = to_tensor(operand1, data_format)
-            t2 = to_tensor(operand2, data_format)
-            t1, t2 = self._apply_fidelity_masking(t1, t2, 1, data_format)
-            t1, t2 = t1.view(M, K1), t2.view(K2, N)
-            res += (
-                torch.matmul(t1, t2)
-                .view(output_dimensions[0] * output_dimensions[1])
-                .to(torch_format)
-            )
-
-        elif num_fidelity_phases == 2:
-
-            t1, t2 = self._apply_fidelity_masking(t1, t2, 0, data_format)
+            t1, t2 = self._apply_fidelity_masking(data_format, t1, t2, 0)
             t1, t2 = t1.view(M, K1), t2.view(K2, N)
             res = (
                 torch.matmul(t1, t2)
@@ -571,7 +644,7 @@ class MatmulGolden(FidelityMasking):
 
             t1 = to_tensor(operand1, data_format)
             t2 = to_tensor(operand2, data_format)
-            t1, t2 = self._apply_fidelity_masking(t1, t2, 1, data_format)
+            t1, t2 = self._apply_fidelity_masking(data_format, t1, t2, 1)
             t1, t2 = t1.view(M, K1), t2.view(K2, N)
             res += (
                 torch.matmul(t1, t2)
@@ -579,15 +652,37 @@ class MatmulGolden(FidelityMasking):
                 .to(torch_format)
             )
 
-            # TODO: INVESTIGATE WHY COMMENTING THIS MAKES TEST PASS
+        elif fidelity_iter_count == 2:
 
-            # t1 = to_tensor(operand1, data_format)
-            # t2 = to_tensor(operand2, data_format)
-            # t1, t2 = self._apply_fidelity_masking(t1, t2, 2, data_format)
-            # t1,t2 = t1.view(M, K1), t2.view(K2, N)
-            # res +=  torch.matmul(t1, t2).view(output_dimensions[0] * output_dimensions[1]).to(torch_format)
+            t1, t2 = self._apply_fidelity_masking(data_format, t1, t2, 0)
+            t1, t2 = t1.view(M, K1), t2.view(K2, N)
+            res = (
+                torch.matmul(t1, t2)
+                .view(output_dimensions[0] * output_dimensions[1])
+                .to(torch_format)
+            )
 
-        elif num_fidelity_phases == 3:
+            t1 = to_tensor(operand1, data_format)
+            t2 = to_tensor(operand2, data_format)
+            t1, t2 = self._apply_fidelity_masking(data_format, t1, t2, 1)
+            t1, t2 = t1.view(M, K1), t2.view(K2, N)
+            res += (
+                torch.matmul(t1, t2)
+                .view(output_dimensions[0] * output_dimensions[1])
+                .to(torch_format)
+            )
+
+            t1 = to_tensor(operand1, data_format)
+            t2 = to_tensor(operand2, data_format)
+            t1, t2 = self._apply_fidelity_masking(data_format, t1, t2, 2)
+            t1, t2 = t1.view(M, K1), t2.view(K2, N)
+            res += (
+                torch.matmul(t1, t2)
+                .view(output_dimensions[0] * output_dimensions[1])
+                .to(torch_format)
+            )
+
+        elif fidelity_iter_count == 3:
 
             t1, t2 = t1.view(M, K1), t2.view(K2, N)
             res = (
@@ -606,6 +701,147 @@ class MatmulGolden(FidelityMasking):
 
 
 @register_golden
+class ScalarBroadcastGolden:
+    """
+    Golden generator for scalar broadcast operations.
+    Takes the first element of the input tensor and broadcasts it across the entire output tile.
+    Output size = num_faces * (face_r_dim * 16) elements, all with the same scalar value.
+    """
+
+    def __call__(
+        self,
+        operand1,
+        data_format,
+        num_faces: int = 4,
+        input_dimensions: list[int] = [32, 32],
+        face_r_dim: int = 16,  # Default to 16 for backward compatibility
+    ):
+        torch_format = format_dict[data_format]
+
+        # Convert input to tensor
+        if not isinstance(operand1, torch.Tensor):
+            operand1 = torch.tensor(operand1)
+
+        # Take the first element as the scalar value to broadcast
+        scalar_value = operand1.flatten()[0]
+
+        # Calculate output size based on variable face dimensions
+        elements_per_tile = face_r_dim * FACE_DIM * num_faces
+
+        # Create output tensor with scalar value replicated across all elements
+        result = torch.full((elements_per_tile,), scalar_value, dtype=torch_format)
+
+        return result
+
+
+@register_golden
+class ColumnBroadcastGolden:
+    """
+    Golden generator for column broadcast operations.
+    Hardware behavior: Faces 0-1 use Face 0's column, Faces 2-3 use Face 2's column
+    (See llk_math_eltwise_binary_broadcast.h lines 136-141)
+
+    For a face_r_dim x 16 face: input has face_r_dim unique values (one per row),
+    each value is replicated 16 times across its row.
+    Output pattern: [row0_val]*16, [row1_val]*16, ..., [row(face_r_dim-1)_val]*16
+    """
+
+    def __call__(
+        self,
+        operand1,
+        data_format,
+        num_faces: int = 4,
+        input_dimensions: list[int] = [32, 32],
+        face_r_dim: int = 16,  # Default to 16 for backward compatibility
+    ):
+        torch_format = format_dict[data_format]
+
+        # Convert input to tensor
+        if isinstance(operand1, torch.Tensor):
+            input_flat = operand1.flatten().to(torch_format)
+        else:
+            # Direct conversion avoids intermediate tensor
+            input_flat = torch.tensor(operand1, dtype=torch_format).flatten()
+
+        # Each face is face_r_dim x 16 elements
+        face_size = face_r_dim * FACE_DIM
+
+        # Process face 0 (used by faces 0-1)
+        source_face_0 = input_flat[:face_size]
+        col_values_0 = source_face_0[::FACE_DIM]
+        face_0_broadcast = col_values_0.repeat_interleave(FACE_DIM)
+
+        # Handle different face counts efficiently
+        if num_faces == 1:
+            output = face_0_broadcast
+        elif num_faces == 2:
+            # Both faces use face 0 - use repeat instead of cat
+            output = face_0_broadcast.repeat(2)
+        else:  # num_faces == 4
+            # Process face 2 (used by faces 2-3)
+            source_face_2 = input_flat[2 * face_size : 3 * face_size]
+            col_values_2 = source_face_2[::FACE_DIM]
+            face_2_broadcast = col_values_2.repeat_interleave(FACE_DIM)
+
+            # Concatenate: face0, face0, face2, face2
+            output = torch.cat(
+                [face_0_broadcast, face_0_broadcast, face_2_broadcast, face_2_broadcast]
+            )
+
+        return output
+
+
+@register_golden
+class RowBroadcastGolden:
+    """Golden generator for row broadcast operations with variable face dimensions."""
+
+    def __call__(
+        self,
+        operand1,
+        data_format,
+        num_faces: int = 4,
+        input_dimensions: list[int] = [32, 32],
+        face_r_dim: int = 16,  # Default to 16 for backward compatibility
+    ):
+        torch_format = format_dict[data_format]
+
+        # Convert input to tensor
+        if isinstance(operand1, torch.Tensor):
+            input_flat = operand1.flatten().to(torch_format)
+        else:
+            # Direct conversion avoids intermediate tensor
+            input_flat = torch.tensor(operand1, dtype=torch_format).flatten()
+
+        # Each face is face_r_dim x 16 elements
+        face_size = face_r_dim * FACE_DIM
+
+        # Process face 0: take first row and repeat to fill face
+        face_0_row = input_flat[:FACE_DIM]
+        face_0_broadcast = face_0_row.repeat(face_r_dim)
+
+        if num_faces == 1:
+            output = face_0_broadcast
+        elif num_faces in (2, 4):
+            # Extract and repeat face 1 row
+            face_1_row = input_flat[face_size : face_size + FACE_DIM]
+            face_1_broadcast = face_1_row.repeat(face_r_dim)
+
+            if num_faces == 2:
+                output = torch.cat([face_0_broadcast, face_1_broadcast])
+            else:  # num_faces == 4
+                output = torch.cat(
+                    [
+                        face_0_broadcast,
+                        face_1_broadcast,
+                        face_0_broadcast,
+                        face_1_broadcast,
+                    ]
+                )
+
+        return output
+
+
+@register_golden
 class DataCopyGolden:
     def __call__(
         self,
@@ -613,22 +849,37 @@ class DataCopyGolden:
         data_format,
         num_faces: int = 4,
         input_dimensions: list[int] = [32, 32],
+        face_r_dim: int = 16,  # Default to 16 for backward compatibility
     ):
         torch_format = format_dict[data_format]
 
         height, width = input_dimensions[0], input_dimensions[1]
-        tile_cnt = (height // 32) * (width // 32)
-        tile_size = height * width // tile_cnt
-        # Depending on the value of 'num_faces' (1, 2, 4), select the first 1, 2 or all 4 faces of a tile
-        elements_per_tile_needed = (tile_size // 4) * num_faces
 
+        # Handle partial faces (face_r_dim < 16) as single tiles
+        if face_r_dim < 16:
+            tile_cnt = 1
+            tile_size = height * width
+        else:
+            tile_cnt = (height // 32) * (width // 32)
+            tile_size = height * width // tile_cnt
+
+        # Calculate elements based on variable face dimensions
+        # Each face is face_r_dim × 16, and we have num_faces
+        elements_per_tile_needed = face_r_dim * FACE_DIM * num_faces
+
+        # Convert input to tensor if needed
         if not isinstance(operand1, torch.Tensor):
-            operand1 = torch.tensor(operand1)
+            operand1 = torch.tensor(operand1, dtype=torch_format)
 
         reshaped = operand1.view(tile_cnt, tile_size)
         selected = reshaped[:, :elements_per_tile_needed]
+        result = selected.flatten()
 
-        return selected.flatten().to(torch_format)
+        # Ensure result is in correct format if not already
+        if result.dtype != torch_format:
+            result = result.to(torch_format)
+
+        return result
 
 
 @register_golden
@@ -658,16 +909,29 @@ class UnarySFPUGolden:
             MathOperation.Threshold: self._threshold,
             MathOperation.ReluMax: self._relu_max,
             MathOperation.ReluMin: self._relu_min,
+            MathOperation.ReduceColumn: self._reduce_columns,
         }
         self.data_format = None
         self.dest_acc = DestAccumulation.No
 
-    def __call__(self, operation, operand1, data_format, dest_acc, input_format):
+    def __call__(
+        self,
+        operation,
+        operand1,
+        data_format,
+        dest_acc,
+        input_format,
+        reduce_pool: Optional[ReducePool] = None,
+    ):
         self.data_format = data_format
         self.dest_acc = dest_acc
 
         if operation not in self.ops:
             raise ValueError(f"Unsupported operation: {operation}")
+
+        # Special handling for SumColumns which needs to process the entire tensor
+        if operation == MathOperation.ReduceColumn:
+            return self.ops[operation](operand1, reduce_pool)
 
         # determine the data format for dst
         if self.dest_acc == DestAccumulation.Yes:
@@ -687,6 +951,7 @@ class UnarySFPUGolden:
                 operand1 = (operand1.view(torch.int32) & 0xFFFF0000).view(torch.float32)
 
         tensor = to_tensor(operand1, dst_format)
+
         result = [self.ops[operation](x) for x in tensor.tolist()]
 
         if self.data_format == DataFormat.Bfp8_b:
@@ -875,6 +1140,24 @@ class UnarySFPUGolden:
         )
         return torch.max(input_tensor, torch.tensor(threshold)).item()
 
+    def _reduce_columns(self, x, reduce_pool: ReducePool):
+        """Reduce columns across tiles, computing sum, average, or max."""
+        # Reduce columns within this tensor
+        # Take max along the height (dim=0) for each column
+        if reduce_pool == ReducePool.Max:
+            reduced_tile = torch.max(x, dim=0).values
+        elif reduce_pool == ReducePool.Sum:
+            reduced_tile = torch.sum(x, dim=0)
+        elif reduce_pool == ReducePool.Average:
+            reduced_tile = torch.sum(x, dim=0) / x.shape[0]
+        else:
+            raise ValueError(f"Unsupported reduce pool type: {reduce_pool}")
+
+        # Construct golden tensor: first row is column max, others are zero
+        reduced_tile_tensor = torch.zeros_like(x)
+        reduced_tile_tensor[0, :] = reduced_tile
+        return reduced_tile_tensor
+
 
 @register_golden
 class EltwiseBinaryGolden(FidelityMasking):
@@ -892,27 +1175,27 @@ class EltwiseBinaryGolden(FidelityMasking):
         t1 = to_tensor(operand1, data_format)
         t2 = to_tensor(operand2, data_format)
 
-        num_fidelity_phases = 0
-
-        _fildelity_dict = {
+        MATH_FIDELITY_TO_ITER_COUNT = {
             MathFidelity.LoFi: 0,
             MathFidelity.HiFi2: 1,
             MathFidelity.HiFi3: 2,
             MathFidelity.HiFi4: 3,
         }
 
-        num_fidelity_phases = _fildelity_dict.get(math_fidelity, 0)
+        fidelity_iter_count = MATH_FIDELITY_TO_ITER_COUNT[math_fidelity]
 
         res = 0
 
         # If multiply is chosen apply fidelity
         if op == MathOperation.Elwmul:
             res = None
-            for phase in range(num_fidelity_phases + 1):
-                t1, t2 = self._apply_fidelity_masking(t1, t2, phase, data_format)
+            for fidelity_iter in range(fidelity_iter_count + 1):
+                t1, t2 = self._apply_fidelity_masking(
+                    data_format, t1, t2, fidelity_iter
+                )
                 phase_result = self.ops[op](t1, t2)
 
-                if phase == 0:
+                if fidelity_iter == 0:
                     res = phase_result
                 else:
                     res += phase_result
@@ -946,6 +1229,7 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
                 MathOperation.SfpuElwRightShift: self._right_shift,
                 MathOperation.SfpuElwLeftShift: self._left_shift,
                 MathOperation.SfpuElwLogicalRightShift: self._logical_right_shift,
+                MathOperation.SfpuAddTopRow: self._add_top_row,
             }
         )
 
@@ -983,6 +1267,13 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
         result = (t1_uint >> t2).to(torch.int32)
         return result
 
+    def _add_top_row(self, t1, t2):
+        """
+        Add top row operation for tile pairs.
+        Takes the element t1 of top row of tile 0 and adds it with element t2 of top row of tile 1.
+        """
+        return t1 + t2
+
 
 @register_golden
 class ReduceGolden:
@@ -1017,12 +1308,12 @@ class ReduceGolden:
         return result.view(1024)
 
     def _reduce_row(self, faces, pool_type, data_format):
-        left_half = torch.cat((faces[0], faces[2]), 1)
-        right_half = torch.cat((faces[1], faces[3]), 1)
+        upper_half = torch.cat((faces[0], faces[1]), 1)
+        lower_half = torch.cat((faces[2], faces[3]), 1)
 
         result = torch.zeros(32, 32, dtype=format_dict[data_format])
-        result[0:16, 0] = self._apply_pooling(left_half, pool_type, dim=1).view(16)
-        result[16:32, 0] = self._apply_pooling(right_half, pool_type, dim=1).view(16)
+        result[0:16, 0] = self._apply_pooling(upper_half, pool_type, dim=1).view(16)
+        result[16:32, 0] = self._apply_pooling(lower_half, pool_type, dim=1).view(16)
 
         return result.view(1024)
 
@@ -1056,8 +1347,24 @@ class UntilizeGolden:
 
 @register_golden
 class TilizeGolden:
-    def __call__(self, operand, dimensions, data_format):
+    def __call__(self, operand, dimensions, data_format, num_faces=4):
+        from helpers.llk_params import format_dict
         from helpers.tilize_untilize import tilize_block
 
+        # Validate the number of faces
+        if not (1 <= num_faces <= 4):
+            raise ValueError(f"`num_faces` must be between 1 and 4, got {num_faces}")
+
+        # Always do full tilization first
         result = tilize_block(operand, dimensions, data_format)
-        return result.flatten()
+        torch_format = format_dict[data_format]
+
+        # Then select the appropriate number of faces from the tilized result
+        if num_faces < FACES_PER_TILE:
+            elements_per_tile_needed = num_faces * ELEMENTS_PER_FACE
+            tile_cnt = result.numel() // ELEMENTS_PER_TILE
+            result = result.reshape(tile_cnt, ELEMENTS_PER_TILE)[
+                :, :elements_per_tile_needed
+            ]
+
+        return result.flatten().to(torch_format)

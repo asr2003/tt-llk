@@ -10,18 +10,26 @@
 #include <utility>
 
 #include "build.h"
+#include "llk_defs.h"
 #include "tensix_types.h"
 
-#if defined(ARCH_WORMHOLE) && defined(ARCH_BLACKHOLE)
-#error "Only one of ARCH_WORMHOLE or ARCH_BLACKHOLE can be defined"
-#elif defined(ARCH_WORMHOLE)
+#if (defined(ARCH_WORMHOLE) + defined(ARCH_BLACKHOLE) + defined(ARCH_QUASAR)) != 1
+#error "Exactly one of ARCH_WORMHOLE, ARCH_BLACKHOLE, or ARCH_QUASAR must be defined"
+#endif
+
+#if defined(ARCH_WORMHOLE)
 constexpr bool is_blackhole = false;
 constexpr bool is_wormhole  = true;
+constexpr bool is_quasar    = false;
 #elif defined(ARCH_BLACKHOLE)
 constexpr bool is_blackhole = true;
 constexpr bool is_wormhole  = false;
-#else
-#error "You must define either ARCH_WORMHOLE or ARCH_BLACKHOLE"
+constexpr bool is_quasar    = false;
+#elif defined(ARCH_QUASAR)
+// Quasar behaves like Blackhole for data format inference
+constexpr bool is_blackhole = false;
+constexpr bool is_wormhole  = false;
+constexpr bool is_quasar    = true;
 #endif
 
 /**
@@ -50,15 +58,24 @@ struct FormatConfig
     }
 };
 
+#ifndef ARCH_QUASAR
 constexpr bool is_exponentB(DataFormat format)
 {
     // Return true if format has an exponentB representation i.e 8-bit exponent
+#if defined(ARCH_QUASAR)
+    return (format == DataFormat::Float16_b || format == DataFormat::Tf32);
+#else
     return (format == DataFormat::Float16_b || format == DataFormat::Bfp8_b || format == DataFormat::Tf32);
+#endif
 }
 
 constexpr bool is_32bit_format(DataFormat format)
 {
+#if defined(ARCH_QUASAR)
+    return format == DataFormat::Int32 || format == DataFormat::Float32;
+#else
     return format == DataFormat::Int32 || format == DataFormat::UInt32 || format == DataFormat::Float32;
+#endif
 }
 
 /**
@@ -74,13 +91,13 @@ constexpr bool is_32bit_format(DataFormat format)
  *
  * @param input The input data format in L1.
  * @param output The output data format in L1.
- * @param is_fp32_dest_acc_en Flag indicating if 32-bit destination accumulation is enabled (dest_acc).
+ * @param dest_datum_width Flag indicating if destination width is 32-bit or 16-bit.
  *
  * @return true if the format combination is an unsupported hardware outlier; false otherwise.
  */
-constexpr bool is_format_combination_outlier(DataFormat input, DataFormat output, bool is_fp32_dest_acc_en)
+constexpr bool is_format_combination_outlier(DataFormat input, DataFormat output, ckernel::DestDatumWidth dest_datum_width)
 {
-    return (is_exponentB(input) && output == DataFormat::Float16 && !is_fp32_dest_acc_en);
+    return (is_exponentB(input) && output == DataFormat::Float16 && dest_datum_width == ckernel::DestDatumWidth::Value::_16Bits);
 }
 
 /**
@@ -167,6 +184,7 @@ constexpr DataFormat infer_pack_in()
             return unpack_out;
         }
     }
+#if !defined(ARCH_QUASAR)
     else if constexpr (INPUT == DataFormat::Float16 && OUTPUT == DataFormat::Bfp8_b && !FP32_ACC)
     {
         // When storing Float16 input in destination registers without FP32 accumulation,
@@ -175,7 +193,8 @@ constexpr DataFormat infer_pack_in()
         // which then converts Bfp8_A to Bfp8_B.
         return DataFormat::Bfp8;
     }
-    else if constexpr (is_format_combination_outlier(INPUT, OUTPUT, FP32_ACC))
+#endif
+    else if constexpr (is_format_combination_outlier(INPUT, OUTPUT, ckernel::DestDatumWidth(FP32_ACC)))
     {
         // Handling a hardware limitation: cannot convert 8-bit exponent datums to Float16 without storing them as intermediate Float32 in dest register.
         // In this case, we set dest registers store 32-bit datums (in params.h).
@@ -253,3 +272,4 @@ constexpr std::array<FormatConfig, N> data_formats()
 
     return build_data_formats<N>(std::make_index_sequence<N> {}, intermediate_config, final_config);
 }
+#endif

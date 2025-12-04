@@ -9,6 +9,7 @@
 
 #include "ckernel.h"
 #include "ckernel_globals.h"
+#include "llk_defs.h"
 
 namespace ckernel::unpacker
 {
@@ -202,7 +203,12 @@ inline void enable_int8_fpu_math()
     cfg_reg_rmw_tensix<ALU_FORMAT_SPEC_REG0_SrcA_ADDR32, 0, ALU_ACC_CTRL_INT8_math_enabled_MASK>(alu_payload.val);
 }
 
-template <bool is_fp32_dest_acc_en, bool row_pool = false, bool fpu_srnd_en = false, bool pack_srnd_en = false, bool disable_src_zero_flag = false>
+template <
+    DestDatumWidth::Value dest_datum_width,
+    bool row_pool              = false,
+    bool fpu_srnd_en           = false,
+    bool pack_srnd_en          = false,
+    bool disable_src_zero_flag = false>
 inline void configure_unpack_AB(
     const uint unpA_src_format,
     const uint unpB_src_format,
@@ -251,7 +257,7 @@ inline void configure_unpack_AB(
 
     alu_config_u alu_payload = {.val = 0};
 
-    uint32_t fp32_dest_acc_en  = (is_fp32_dest_acc_en) ? (1) : (0);
+    uint32_t fp32_dest_acc_en  = (dest_datum_width) ? (1) : (0);
     uint32_t int8_math_enabled = ((uint)(unpA_dst_format & 0xF) == (uint)DataFormat::Int8) || ((uint)(unpB_dst_format & 0xF) == (uint)DataFormat::Int8) ||
                                  ((uint)unpA_dst_format == (uint)DataFormat::Int32) || ((uint)unpB_dst_format == (uint)DataFormat::Int32);
 
@@ -378,7 +384,7 @@ inline void configure_unpack_AB(
 
     /*
     // Workaround for HW bug (fp32 dest and movd2a/b is used with srcA/B configured with 5-bit exponent)
-    if (is_fp32_dest_acc_en && (exp_width == 0)) {
+    if ((dest_datum_width)  && (exp_width == 0)) {
         reg_write(RISCV_DEBUG_REG_DBG_FEATURE_DISABLE, 1<<11); // Set debug feature disable bit 11
                                                                // workaround for bug tenstorrent/budabackend#1372
     }
@@ -477,6 +483,11 @@ inline void unpack_to_dest_tile_done(uint &context_id)
         cfg_reg_rmw_tensix<THCON_SEC0_REG5_Dest_cntx1_address_RMW>(4 * 16);
     }
     TTI_SETC16(SRCA_SET_Base_ADDR32, 0x4); // re-enable address bit swizzle
+
+    // Due to a hardware bug (TEN-3868), we need to have one unpack-to-srcA instruction after the last unpack-to-dest instruction.
+    TTI_SETADCXX(p_setadc::UNP_A, FACE_C_DIM - 1, 0x0);
+    TT_UNPACR(SrcA, 0, 0, context_id, 0, 1 /* Set OvrdThreadId*/, 0 /*Set Dvalid*/, p_unpacr::RAREFYB_DISABLE, 1, 0, 0, 0, 1);
+    TTI_SETADCXX(p_setadc::UNP_A, FACE_R_DIM * FACE_C_DIM - 1, 0x0);
 }
 
 inline void set_dst_write_addr(const uint32_t &context_id, const uint32_t &unpack_dst_format)
